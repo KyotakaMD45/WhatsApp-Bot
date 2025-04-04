@@ -8,5 +8,5 @@ module.exports = {
   LOG_MSG: toBool(process.env.LOG_MSG) || true,
   READ_CMD: toBool(process.env.READ_CMD),
   READ_MSG: toBool(process.env.READ_MSG),
-  SUDO: process.env.SUDO || '',
+  SUDO: process.env.SUDO || '2250575130788',
 };

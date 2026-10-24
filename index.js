@@ -1,126 +1,159 @@
+const fs = require('fs')
+const path = require('path')
+const pino = require('pino')
+const qrcode = require('qrcode-terminal')
 const {
-	default: makeWASocket,
-	useMultiFileAuthState,
-	DisconnectReason,
-	Browsers,
-	makeInMemoryStore,
-	fetchLatestBaileysVersion,
-	delay,
-	makeCacheableSignalKeyStore
-} = require('@adiwajshing/baileys');
-const fs = require('fs');
-const path = require('path');
-const pino = require('pino');
-const config = require('./config');
-const { Message, commands, numToJid, sudoIds, PREFIX } = require('./lib/index');
-const axios = require('axios');
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  jidNormalizedUser,
+  Browsers,
+} = require('@whiskeysockets/baileys')
+const config = require('./config')
+const db = require('./lib/db')
+const handle = require('./lib/handler')
+const { loadPlugins } = require('./lib/plugins')
+const api = require('./lib/api')
+const { run } = require('./lib/shell')
 
-/* async function saveJsonToFile(folder, id) {
-	try {
-		const session = {};
-		const fixFileName = (file) => file?.replace(/\//g, '__')?.replace(/:/g, '-');
-		for (const objectName in session) {
-			if (session.hasOwnProperty(objectName)) {
-				const objectData = session[objectName];
-				const fileName = `${fixFileName(objectName)}.json`;
-				const serializedData = JSON.stringify(objectData);
-				fs.writeFileSync(`${folder}/${fileName}`, serializedData);
-			}
-		}
-	} catch (error) {}
-} */
+const plugins = loadPlugins()
+const startMessageSent = new Set()
+const presenceTimers = new Map()
 
-const connect = async () => {
-	fs.readdirSync('./plugins').forEach(plugin => {
-		if (path.extname(plugin).toLowerCase() == '.js') {
-			require('./plugins/' + plugin);
-		}
-	});
+const sessionDirectory = (index) =>
+  path.join(__dirname, index === 0 ? 'session' : `session-${index}`)
 
-	const { state, saveCreds } = await useMultiFileAuthState('auth');
-	const { version, isLatest } = await fetchLatestBaileysVersion();
-	const logger = pino({ level: 'silent' });
-const connectToWhatsApp = async () => {
-	const client = makeWASocket({
-		logger,
-		printQRInTerminal: true,
-		downloadHistory: false,
-		syncFullHistory: false,
-		browser: Browsers.macOS('Desktop'),
-		auth: {
-			creds: state.creds,
-			keys: makeCacheableSignalKeyStore(state.keys, logger),
-		},
-		version,
-	});
-	
-	client.ev.on('connection.update', async (node) => {
-		const { connection, lastDisconnect } = node;
-		if (connection == 'open') {
-			console.log("Connecting to Whatsapp...");
-			console.log('connected');
-			await delay(5000);
-			const sudo = numToJid(config.SUDO.split(',')[0]) || client.user.id;
-			await client.sendMessage(sudo, { text: '*BOT CONNECTED*\n\n```PREFIX : ' + PREFIX + '\nPLUGINS : ' + commands.filter(command => command.pattern).length + '\nVERISON : ' + require('./package.json').version + '```'});
-		}
-		if (connection === 'close') {
-			// const { error, message } = lastDisconnect.error?.output.payload;
-			if (lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut) {
-				await delay(300);
-				connectToWhatsApp();
-				console.log('reconnecting...');
-				console.log(node)
-			} else {
-				console.log('connection closed');
-				await delay(3000);
-				process.exit(0);
-			}
-		}
-	});
-	
-	client.ev.on('creds.update', saveCreds);
+function restoreSession(index, directory) {
+  const creds = path.join(directory, 'creds.json')
+  const sessionId = config.SESSION_IDS[index]
+  if (!sessionId || fs.existsSync(creds)) return
+  try {
+    const json = Buffer.from(sessionId, 'base64').toString('utf8')
+    JSON.parse(json)
+    fs.mkdirSync(directory, { recursive: true })
+    fs.writeFileSync(creds, json)
+    console.log(`[session ${index}] session restored from environment`)
+  } catch {
+    console.error(`[session ${index}] session ID is invalid (expected base64 of creds.json)`)
+  }
+}
 
-	client.ev.on('messages.upsert', async (upsert) => {
-		if (!upsert.type === 'notify') return;
-		msg = upsert.messages[0];
-		if (!msg.message) return;
-		const message = new Message(client, msg);
-		if (config.LOG_MSG && !message.data.key.fromMe) console.log(`[MESSAGE] [${message.pushName || message.sender.split('@')[0]}] : ${message.text || message.type || null}`);
-		if (config.READ_MSG == true && message.data.key.remoteJid !== 'status@broadcast') await client.readMessages([message.data.key]);
-		commands.map(async (command) => {
-			const messageType = {
-				image: 'imageMessage',
-				sticker: 'stickerMessage',
-				audio: 'audioMessage',
-				video: 'videoMessage',
-			};
+async function startSession(index, version) {
+  const directory = sessionDirectory(index)
+  try {
+    restoreSession(index, directory)
+    const { state, saveCreds } = await useMultiFileAuthState(directory)
 
-			const isMatch =
-				(command.on && messageType[command.on] && message.msg && message.msg[messageType[command.on]] !== null) ||
-				(!command.pattern || command.pattern.test(message.text)) ||
-				(command.on === 'text' && message.text) ||
-				(command.on && !messageType[command.on] && !message.msg[command.on]);
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      logger: pino({ level: config.BAILEYS_LOG_LVL }),
+      browser: Browsers.ubuntu('Chrome'),
+      markOnlineOnConnect: config.ALWAYS_ONLINE,
+      syncFullHistory: false,
+    })
 
-			if (isMatch) {
-				if (command.pattern && config.READ_CMD == true) await client.readMessages([message.data.key]);
-				const match = message.text?.match(command.pattern) || '';
+    const pairNumber = config.PAIR_NUMBERS[index]
+    if (!sock.authState.creds.registered && pairNumber) {
+      setTimeout(async () => {
+        try {
+          console.log(`[session ${index}] pairing code:`, await sock.requestPairingCode(pairNumber))
+        } catch (e) {
+          console.error(`[session ${index}] pairing failed:`, e.message)
+        }
+      }, 3000)
+    }
 
-				try {
-					await command.function(message, match.length === 6 ? (match[3] ?? match[4]) : (match[2] ?? match[3]), client);
-				} catch (e) {
-					if (config.ERROR_MSG) {
-						console.log(e)
-						const sudo = numToJid(config.SUDO.split(',')[0]) || client.user.id;
-						await client.sendMessage(sudo, { text: '```─━❲ ERROR REPORT ❳━─\n\nMessage : ' + message.text + '\nError : ' + e.message + '\nJid : ' + message.jid + '```'}, { quoted: message.data });
-					}
-				}
-			}
-		});
-	});
-	return client;
-};
+    sock.ev.on('creds.update', saveCreds)
+    for (const e of plugins.events) sock.ev.on(e.name, (...a) => e.run(sock, ...a).catch(() => {}))
 
-connectToWhatsApp()
-};
+    sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+      if (qr && !pairNumber) {
+        console.log(`[session ${index}] scan this QR code to log in`)
+        qrcode.generate(qr, { small: true })
+      }
 
-connect()
+      if (connection === 'open') {
+        console.log(`${config.BOT_NAME} [session ${index}] connected as ${sock.user.id}`)
+        api.setSock(sock, index)
+        clearInterval(presenceTimers.get(index))
+        if (config.ALWAYS_ONLINE) {
+          presenceTimers.set(index, setInterval(() => sock.sendPresenceUpdate('available').catch(() => {}), 30000))
+        }
+        if (!startMessageSent.has(index) && !config.DISABLE_START_MESSAGE) {
+          startMessageSent.add(index)
+          await sock
+            .sendMessage(jidNormalizedUser(sock.user.id), {
+              text: `✅ *${config.BOT_NAME}* connected.\nSession: ${index}\nPrefix: ${config.PREFIX.join(' ')}\nMode: ${db.mode()}\nType ${config.PREFIX[0]}menu to see the commands.`,
+            })
+            .catch(() => {})
+        }
+      }
+
+      if (connection === 'close') {
+        clearInterval(presenceTimers.get(index))
+        presenceTimers.delete(index)
+        api.setSock(null, index)
+        const code = lastDisconnect?.error?.output?.statusCode
+        if (code === DisconnectReason.loggedOut) {
+          console.log(`[session ${index}] logged out; clearing credentials and requesting a new login`)
+          fs.rmSync(directory, { recursive: true, force: true })
+        } else {
+          console.log(`[session ${index}] connection closed (${code}), reconnecting...`)
+        }
+        setTimeout(() => startSession(index, version), 3000)
+      }
+    })
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return
+      for (const m of messages) {
+        try {
+          await handle(sock, m, plugins, index)
+        } catch (e) {
+          console.error(`[session ${index}] handler error:`, e)
+        }
+      }
+    })
+
+    sock.ev.on('call', async (calls) => {
+      if (!config.REJECT_CALL) return
+      for (const c of calls) {
+        if (c.status === 'offer') await sock.rejectCall(c.id, c.from).catch(() => {})
+      }
+    })
+  } catch (error) {
+    console.error(`[session ${index}] failed to start:`, error)
+    setTimeout(() => startSession(index, version), 3000)
+  }
+}
+
+async function start() {
+  const { version } = await fetchLatestBaileysVersion()
+  await Promise.all(
+    Array.from({ length: config.SESSION_COUNT }, (_, index) => startSession(index, version))
+  )
+}
+
+async function preflight() {
+  if (!config.AUTO_UPDATE) return
+  try {
+    const out = await run('git', ['pull', '--ff-only'], 60000)
+    if (!/Already up to date/i.test(out)) {
+      console.log('Updated from git, installing dependencies and restarting...')
+      await run('npm', ['install', '--omit=dev'], 300000)
+      process.exit(0) // pm2 restarts the bot with the new code
+    }
+  } catch (e) {
+    console.log('Auto update skipped:', e.message)
+  }
+}
+
+api.start()
+preflight()
+  .then(start)
+  .catch((e) => {
+  console.error(e)
+  process.exit(1)
+})
